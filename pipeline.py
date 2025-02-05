@@ -43,14 +43,9 @@ for module in ["faster_whisper", "models.diarization", "speechbrain", "pyannote"
     module_logger.addHandler(logging.FileHandler("main.log"))
 
 # Import whisper components
-from whisper_online import (
-    FasterWhisperASR,
-    OnlineASRProcessor,
-    HypothesisBuffer,
-    load_audio_chunk,
-    load_audio,
-    set_logging,
-)
+from models.whisper.asr import FasterWhisperASR
+from models.whisper.processor import OnlineASRProcessor, HypothesisBuffer
+from utils.audio import load_audio_chunk, load_audio
 
 # Initialize colorama
 init(autoreset=True)

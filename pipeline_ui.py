@@ -406,16 +406,6 @@ def format_status(pipeline, system_monitor) -> tuple:
     model_info.add_row("[dim]Features:[/dim]", "[cyan]Fbank + Mel Stats[/cyan]")
     model_info.add_row("[dim]Index:[/dim]", "[cyan]FAISS[/cyan]")
     
-    # Add inference stats if available
-    if hasattr(pipeline, 'model_stats'):
-        stats = pipeline.model_stats.get_stats()
-        if stats:
-            model_info.add_row("", "")  # Spacer
-            model_info.add_row("[bold cyan]Inference Stats[/bold cyan]", "")
-            
-            for model_name, latency_text in format_latency_stats(stats):
-                model_info.add_row(f"[dim]{model_name}:[/dim]", latency_text)
-    
     # System stats table
     sys_stats = Table(
         show_header=False,
