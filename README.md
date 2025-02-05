@@ -1,138 +1,183 @@
 # Whisper Streaming Transcription
 
-## Overview
+A real-time streaming transcription system with voice activity detection (VAD), speaker diarization, and a rich terminal UI. The system leverages Whisper models through the Faster-Whisper backend for efficient transcription.
 
-This repository implements a real-time streaming transcription application using various ASR backends, enhanced with features like voice activity detection (VAD), diarization, and a rich terminal UI. The system leverages Whisper, Faster-Whisper, and other models to provide robust, low-latency transcription with detailed system monitoring.
+## Features
+
+- **Real-time Transcription**: Low-latency streaming transcription using Faster-Whisper
+- **Voice Activity Detection**: Silero VAD for accurate speech detection
+- **Speaker Diarization**: Pyannote-based speaker diarization with ECAPA-TDNN embeddings
+- **Rich Terminal UI**: Interactive display with:
+  - Live transcription view
+  - Transcript history with speaker labels
+  - System performance metrics
+  - Voice activity visualization
+  - Model status monitoring
+- **Performance Optimization**:
+  - Efficient audio buffering and processing
+  - Multi-threaded pipeline architecture
+  - GPU acceleration support
+  - Latency monitoring and statistics
 
 ## Project Structure
 
-- **pipeline_ui.py**: Real-time transcription UI that displays live transcription, transcript history, assistant responses, model status, system stats, and VAD information.
-- **pipeline.py**: Streaming transcription pipeline with diarization support; processes audio from the microphone and outputs results to the console.
-- **whisper_online.py**: Implements various ASR backends (Faster-Whisper, MLX-Whisper, WhisperTimestamped, OpenAI API) and is used by the pipeline modules.
-- **models/**: Contains modules for VAD (`vad.py`), diarization (`diarization.py`), and other audio processing utilities.
-- **README.md**: This file.
+```
+└── whisper_streaming/
+    ├── pipeline.py           # Core streaming pipeline implementation
+    ├── pipeline_ui.py        # Terminal UI and visualization
+    ├── silero_vad_iterator.py # VAD utilities
+    ├── whisper_env.yml       # Conda environment specification
+    ├── models/
+    │   ├── buffer_manager.py # Audio buffer management
+    │   ├── diarization.py    # Speaker diarization
+    │   ├── stats.py         # Performance monitoring
+    │   ├── vad.py           # Voice activity detection
+    │   ├── visualizer.py    # UI visualization components
+    │   └── whisper/         # Whisper ASR components
+    │       ├── asr.py       # ASR model implementation
+    │       └── processor.py # Online ASR processing
+    └── utils/
+        └── audio.py         # Audio loading utilities
+```
 
 ## Installation
 
-Ensure you have Python 3.7+ installed. Install required dependencies. It is recommended to use a virtual environment.
+1. Create a Conda environment using the provided environment file:
+   ```bash
+   conda env create -f whisper_env.yml
+   conda activate whisper_env
+   ```
 
-```bash
-pip install -r requirements.txt
-```
-
-If a `requirements.txt` file is not provided, make sure to install the following packages (and their dependencies):
-
-- torch
-- rich
-- psutil
-- numpy
-- sounddevice
-- librosa
-- faster-whisper (or whisper model libraries)
-- pynvml
-- pyannote.audio
-- speechbrain
-- faiss
-- and other dependencies as required by the code.
+2. Set up environment variables:
+   Create a `.env` file with your Hugging Face token for diarization model access:
+   ```
+   HUGGING_FACE_HUB_TOKEN=your_token_here
+   ```
 
 ## Usage
 
-### Running the UI (pipeline_ui.py)
+### Terminal UI (pipeline_ui.py)
 
-The `pipeline_ui.py` script launches an interactive user interface that displays live transcription along with transcript history, assistant responses, active model status, system stats, and VAD information.
+The UI provides a rich interactive display with real-time transcription, speaker tracking, and system monitoring.
 
-#### Command-Line Arguments (pipeline_ui.py):
+```bash
+python pipeline_ui.py --use-mic [options]
+```
 
-- `--use-mic`: Use microphone input.
-- `--model`: Choose the ASR model. Available options: `tiny.en`, `tiny`, `base.en`, `base`, `small.en`, `small`, `medium.en`, `medium`, `large-v1`, `large-v2`, `large-v3`, `large`, `large-v3-turbo`, `distil-large-v3`. (Default: `large-v3-turbo`)
-- `--compute-type`: Set the model's computation type. Options: `int8_float16`, `float16`, `float32`, `int8`. (Default: `int8_float16`)
-- `--min-chunk-size`: Minimum audio chunk size in seconds. (Default: `1.0`)
-- `--batch-size`: Batch size for model inference. (Default: `8`)
+Options:
+- `--model`: Whisper model size (default: large-v3-turbo)
+  - Available: tiny.en, tiny, base.en, base, small.en, small, medium.en, medium, large-v1/v2/v3, large-v3-turbo, distil-large-v3
+- `--compute-type`: Model computation type (default: int8_float16)
+  - Options: int8_float16, float16, float32, int8
+- `--min-chunk-size`: Minimum audio chunk size in seconds (default: 1.0)
+- `--batch-size`: Batch size for inference (default: 8)
 
-#### Examples (pipeline_ui.py):
+### Core Pipeline (pipeline.py)
 
-- **Basic Usage with Microphone**
+For headless operation or integration into other applications:
 
-  ```bash
-  python pipeline_ui.py --use-mic
-  ```
+```bash
+python pipeline.py --use-mic [options]
+```
 
-- **Using a Different Model and Compute Type**
+Additional options:
+- `--language`: Target language code (default: en)
 
-  ```bash
-  python pipeline_ui.py --use-mic --model base --compute-type float16
-  ```
+## Components
 
-- **Custom Chunk Size and Batch Size**
+### Voice Activity Detection (VAD)
 
-  ```bash
-  python pipeline_ui.py --use-mic --min-chunk-size 0.5 --batch-size 4
-  ```
+- Uses Silero VAD for efficient speech detection
+- Configurable thresholds and window sizes
+- Optimized for 16kHz audio input
+- Provides speech probability scores
 
-- **Full Command Example**
+### Speaker Diarization
 
-  ```bash
-  python pipeline_ui.py --use-mic --model small.en --compute-type int8_float16 --min-chunk-size 1.0 --batch-size 8
-  ```
+- Pyannote.audio 3.1 for diarization
+- ECAPA-TDNN speaker embeddings
+- FAISS-based speaker indexing
+- Adaptive speaker tracking
+- Supports up to 4 concurrent speakers
 
-### Running the Pipeline (pipeline.py)
+### ASR Processing
 
-The `pipeline.py` script runs the complete streaming transcription pipeline with diarization capabilities. It captures audio from the microphone and outputs transcription results to the console.
+- Faster-Whisper backend
+- Streaming-optimized processing
+- Configurable batch processing
+- Word-level timestamps
+- Context management for improved accuracy
 
-#### Command-Line Arguments (pipeline.py):
+### Performance Monitoring
 
-- `--use-mic`: Use microphone input.
-- `--model`: Choose the ASR model. (Same options as above; Default: `large-v3-turbo`)
-- `--language`: Language code (e.g., `en`, `de`). (Default: `en`)
-- `--compute-type`: Set the model's computation type. Options: `int8_float16`, `float16`, `float32`. (Default: `int8_float16`)
-- `--min-chunk-size`: Minimum audio chunk size in seconds. (Default: `1.0`)
-- `--batch-size`: Batch size for model inference. (Default: `8`)
+- Real-time latency tracking
+- GPU memory and utilization monitoring
+- CPU usage statistics
+- Model-specific performance metrics
 
-#### Examples (pipeline.py):
+## UI Layout
 
-- **Running with Microphone Input**
+The terminal UI is divided into several panels:
 
-  ```bash
-  python pipeline.py --use-mic
-  ```
+1. **Live Transcription** (Top)
+   - Real-time speech-to-text output
+   - Punctuation highlighting
 
-- **Specifying a Model and Language**
+2. **Transcript History** (Middle-Left)
+   - Speaker-labeled transcripts
+   - Timestamp and duration info
+   - Color-coded speaker identification
 
-  ```bash
-  python pipeline.py --use-mic --model medium --language en
-  ```
+3. **System Status** (Bottom)
+   - Model latency statistics
+   - CPU/GPU utilization
+   - Memory usage tracking
 
-- **Custom Compute Type**
+4. **Voice Activity** (Right)
+   - Speech probability visualization
+   - Buffer usage indicators
+   - Silence detection progress
 
-  ```bash
-  python pipeline.py --use-mic --compute-type float32
-  ```
+## Performance Considerations
 
-- **Full Command Example**
-
-  ```bash
-  python pipeline.py --use-mic --model large-v3-turbo --language en --compute-type int8_float16 --min-chunk-size 1.0 --batch-size 8
-  ```
-
-## Additional Notes
-
-- **Rich UI**: The terminal UI is built using the Rich library, offering visually appealing progress bars and layout management.
-- **Real-Time Processing**: The system uses multi-threading for real-time VAD, transcription, and diarization. Monitor logs for performance details.
-- **Logging**: Detailed logs are written to `transcription.log` (for UI) and `main.log` (for the pipeline). Use these for troubleshooting.
-- **Resource Monitoring**: System and model performance metrics (like CPU usage, GPU load, and latency statistics) are displayed in the UI.
-- **UI-specific Configurations**: Latency thresholds and duration color-coding remain in `pipeline_ui.py` to maintain focus on UI concerns.
+- **GPU Memory**: Models are optimized for efficient GPU memory usage
+- **CPU Usage**: Multi-threaded design with configurable thread allocation
+- **Latency**: Monitored and optimized for real-time performance
+- **Buffer Management**: Efficient circular buffer implementation
 
 ## Troubleshooting
 
-- **NVML/GPU Issues**: Ensure your GPU drivers and NVML library are up-to-date.
-- **Audio Input Issues**: Verify that your microphone is properly configured and working.
-- **Performance**: Adjust the `--min-chunk-size` and `--compute-type` if you experience high latency or CPU load.
-- **Logs**: Refer to `transcription.log` and `main.log` for detailed error messages and performance stats.
+1. **GPU Issues**:
+   - Ensure CUDA and cuDNN are properly installed
+   - Monitor GPU memory usage in the UI
+   - Try different compute_type settings
 
-## Contributing
+2. **Audio Input**:
+   - Check microphone configuration
+   - Verify audio sample rate (should be 16kHz)
+   - Monitor VAD visualization for input detection
 
-Contributions, bug reports, and feature requests are welcome. Please submit a pull request or open an issue on GitHub.
+3. **Performance**:
+   - Adjust batch_size for better throughput
+   - Monitor latency statistics in the UI
+   - Consider using a smaller model for faster processing
+
+4. **Diarization**:
+   - Ensure valid Hugging Face token
+   - Check speaker detection thresholds
+   - Monitor diarization latency metrics
+
+## Logging
+
+- Main log file: `main.log`
+- Transcription log: `transcription.log`
+- Detailed model performance metrics in logs
+- Error tracking and debugging information
 
 ## License
 
-This project is licensed under the MIT License. 
+This project is licensed under the MIT License.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit pull requests or open issues for bugs and feature requests. 
