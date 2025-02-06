@@ -16,6 +16,7 @@ from speechbrain.nnet.pooling import StatisticsPooling
 from speechbrain.nnet.linear import Linear
 from speechbrain.nnet.normalization import BatchNorm1d
 from dotenv import load_dotenv
+from utils.benchmark import ComponentBenchmark, BenchmarkContext
 
 # Load environment variables
 load_dotenv()
@@ -112,6 +113,9 @@ class DiarizationModel:
         os.makedirs(self.speechbrain_cache_dir, exist_ok=True)
         os.makedirs(self.embeddings_dir, exist_ok=True)
         
+        # Initialize benchmark if enabled
+        self.benchmark = None
+        
         self._setup_torch_config()
         self._initialize_model()
         
@@ -190,19 +194,25 @@ class DiarizationModel:
             # Extract embedding using SpeechBrain
             with torch.no_grad():
                 try:
-                    # ECAPA-TDNN expects normalized input
-                    segment_length = segment_waveform.shape[1]
-                    segment_waveform = segment_waveform / (torch.max(torch.abs(segment_waveform)) + 1e-8)
-                    
-                    # Get embedding
-                    embeddings = self.embedding_model.encode_batch(segment_waveform)
-                    embedding = embeddings.squeeze().cpu().numpy()
-                    
-                    # Convert to float32 and normalize for cosine similarity
-                    embedding = embedding.astype(np.float32)
-                    embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
-                    
-                    return embedding
+                    with BenchmarkContext(self.benchmark, "embedding", end_sample - start_sample) as bench:
+                        # ECAPA-TDNN expects normalized input
+                        segment_length = segment_waveform.shape[1]
+                        segment_waveform = segment_waveform / (torch.max(torch.abs(segment_waveform)) + 1e-8)
+                        
+                        # Get embedding
+                        embeddings = self.embedding_model.encode_batch(segment_waveform)
+                        embedding = embeddings.squeeze().cpu().numpy()
+                        
+                        # Convert to float32 and normalize for cosine similarity
+                        embedding = embedding.astype(np.float32)
+                        embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
+                        
+                        bench.context.update({
+                            "segment_length": segment_length,
+                            "embedding_dim": embedding.shape[0]
+                        })
+                        
+                        return embedding
                     
                 except Exception as e:
                     logger.error(f"Error in embedding extraction: {e}", exc_info=True)
@@ -328,71 +338,91 @@ class DiarizationModel:
             # Ensure audio data is on the correct device
             waveform = torch.from_numpy(audio_data).unsqueeze(0).to(self.device)
             
-            with suppress_reproducibility_warning():
-                diarization = self.pipeline({
-                    "waveform": waveform,
-                    "sample_rate": samplerate
-                })
-            
-            # Convert diarization result to a more usable format
-            results = []
-            
-            # Auto-save embeddings periodically
-            should_save = False
-            
-            # Group very short segments
-            MIN_SEGMENT_DURATION = 0.5  # seconds
-            current_speaker = None
-            current_start = None
-            current_end = None
+            with BenchmarkContext(self.benchmark, "diarize", len(audio_data)) as bench:
+                with suppress_reproducibility_warning():
+                    diarization = self.pipeline({
+                        "waveform": waveform,
+                        "sample_rate": samplerate
+                    })
+                
+                # Convert diarization result to a more usable format
+                results = []
+                
+                # Auto-save embeddings periodically
+                should_save = False
+                
+                # Group very short segments
+                MIN_SEGMENT_DURATION = 0.5  # seconds
+                current_speaker = None
+                current_start = None
+                current_end = None
+                
+                segment_count = 0
+                total_duration = 0
 
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                try:
-                    duration = turn.end - turn.start
-                    if duration < MIN_SEGMENT_DURATION:
-                        logger.debug(f"Skipping short segment: {duration:.2f}s")
-                        continue
+                for turn, _, speaker in diarization.itertracks(yield_label=True):
+                    try:
+                        duration = turn.end - turn.start
+                        if duration < MIN_SEGMENT_DURATION:
+                            logger.debug(f"Skipping short segment: {duration:.2f}s")
+                            continue
+                            
+                        # Get embedding for this segment
+                        segment_start_sample = int(turn.start * samplerate)
+                        segment_end_sample = int(turn.end * samplerate)
+                        segment_embedding = self._extract_embedding(waveform, segment_start_sample, segment_end_sample)
                         
-                    # Get embedding for this segment
-                    segment_start_sample = int(turn.start * samplerate)
-                    segment_end_sample = int(turn.end * samplerate)
-                    segment_embedding = self._extract_embedding(waveform, segment_start_sample, segment_end_sample)
-                    
-                    # Match with existing speakers or create new one
-                    matched_speaker = self._match_speaker(segment_embedding)
-                    if matched_speaker is None:
-                        matched_speaker = speaker  # Fallback to original label
-                    
-                    # Try to merge with previous segment if same speaker and close in time
-                    if current_speaker == matched_speaker and turn.start - current_end < 0.5:
-                        current_end = turn.end
-                    else:
-                        # Save previous segment if exists
-                        if current_speaker is not None:
-                            results.append({
-                                'start': current_start,
-                                'end': current_end,
-                                'speaker': current_speaker,
-                                'duration': current_end - current_start
+                        # Match with existing speakers or create new one
+                        with BenchmarkContext(self.benchmark, "speaker_match", segment_end_sample - segment_start_sample) as match_bench:
+                            matched_speaker = self._match_speaker(segment_embedding)
+                            if matched_speaker is None:
+                                matched_speaker = speaker  # Fallback to original label
+                            
+                            match_bench.context.update({
+                                "matched_speaker": matched_speaker,
+                                "segment_duration": duration
                             })
-                        current_speaker = matched_speaker
-                        current_start = turn.start
-                        current_end = turn.end
-                    
-                    logger.info(f'start={turn.start:.1f}s stop={turn.end:.1f}s {matched_speaker} (duration: {duration:.1f}s)')
-                    should_save = True
-                    
-                except Exception as e:
-                    logger.error(f'Error processing segment: {e}')
-                    continue
-            
-            # Add final segment
-            if current_speaker is not None:
-                results.append({
-                    'start': current_start,
-                    'end': current_end,
-                    'speaker': current_speaker,
-                    'duration': current_end - current_start
+                        
+                        # Try to merge with previous segment if same speaker and close in time
+                        if current_speaker == matched_speaker and turn.start - current_end < 0.5:
+                            current_end = turn.end
+                        else:
+                            # Save previous segment if exists
+                            if current_speaker is not None:
+                                results.append({
+                                    'start': current_start,
+                                    'end': current_end,
+                                    'speaker': current_speaker,
+                                    'duration': current_end - current_start
+                                })
+                            current_speaker = matched_speaker
+                            current_start = turn.start
+                            current_end = turn.end
+                        
+                        logger.info(f'start={turn.start:.1f}s stop={turn.end:.1f}s {matched_speaker} (duration: {duration:.1f}s)')
+                        should_save = True
+                        
+                        segment_count += 1
+                        total_duration += duration
+                        
+                    except Exception as e:
+                        logger.error(f'Error processing segment: {e}')
+                        continue
+                
+                # Add final segment
+                if current_speaker is not None:
+                    results.append({
+                        'start': current_start,
+                        'end': current_end,
+                        'speaker': current_speaker,
+                        'duration': current_end - current_start
+                    })
+                
+                # Update benchmark context with final stats
+                bench.context.update({
+                    "segment_count": segment_count,
+                    "total_duration": total_duration,
+                    "unique_speakers": len(set(r['speaker'] for r in results))
                 })
             
             # Auto-save embeddings if we processed any segments
@@ -480,4 +510,13 @@ class DiarizationModel:
             
         except Exception as e:
             logger.error(f"Error normalizing embedding: {e}")
-            return None 
+            return None
+
+    def enable_benchmark(self, enable: bool = True):
+        """Enable or disable benchmarking."""
+        if enable and self.benchmark is None:
+            self.benchmark = ComponentBenchmark("diarization")
+        elif not enable:
+            if self.benchmark is not None:
+                self.benchmark.close()
+            self.benchmark = None 

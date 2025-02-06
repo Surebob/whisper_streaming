@@ -10,6 +10,10 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 class BenchmarkAnalyzer:
     """Analyzes benchmark data from JSONL files."""
@@ -185,280 +189,141 @@ class BenchmarkAnalyzer:
         if df.empty:
             return df
             
-        # Skip warmup period
-        df = df.iloc[self.warmup_samples:]
+        # Skip warmup period - use smaller warmup for small datasets
+        warmup = min(5, len(df) // 10) if len(df) < 100 else self.warmup_samples
+        df = df.iloc[warmup:]
         
-        # Remove extreme outliers (beyond 99th percentile) for better visualization
-        for col in ['duration_ms', 'throughput', 'memory_mb']:
-            if col in df.columns:
+        # For each numeric column, clip extreme outliers at 99th percentile
+        numeric_cols = ['duration_ms', 'throughput', 'memory_mb']
+        for col in numeric_cols:
+            if col in df.columns and not df[col].empty:
                 q99 = df[col].quantile(0.99)
-                df[col] = df[col].clip(upper=q99)
+                if not pd.isna(q99):
+                    df[col] = df[col].clip(upper=q99)
         
         return df
     
     def _plot_duration_distributions(self, df, component, plot_dir):
         """Generate duration distribution plots."""
         try:
+            if len(df) < 2:
+                logger.warning(f"Not enough data points for {component} duration plots")
+                return
+                
             plt.figure(figsize=(15, 8))
-            
-            # 1. Enhanced Violin Plot
-            plt.subplot(2, 2, 1)
-            if len(df['operation'].unique()) == 1:
-                # Single operation - use primary color
-                sns.violinplot(data=df, x='operation', y='duration_ms',
-                             color='#e34a33', width=0.8, inner='box',
-                             density_norm='width')
-            else:
-                # Multiple operations - use color scheme
-                df_melted = df.copy()
-                df_melted['hue'] = df_melted['operation']
-                sns.violinplot(data=df_melted, x='operation', y='duration_ms',
-                             hue='hue', legend=False,
-                             palette=dict(zip(df['operation'].unique(),
-                                            self._get_operation_colors(df['operation'].unique()))),
-                             width=0.8, inner='box', density_norm='width')
-            plt.title('Duration Distribution (ms)')
-            plt.xticks(rotation=45)
-            
-            # 2. KDE Plot
-            plt.subplot(2, 2, 2)
             operations = df['operation'].unique()
-            if len(operations) == 1:
-                op_data = df[df['operation'] == operations[0]]
-                sns.kdeplot(data=op_data['duration_ms'],
-                          color='#e34a33',
-                          label=operations[0], fill=True, alpha=0.5)
-            else:
-                for operation in operations:
-                    op_data = df[df['operation'] == operation]
-                    if len(op_data) > 1:
-                        sns.kdeplot(data=op_data['duration_ms'],
-                                  color=self._get_operation_color(operation),
-                                  label=operation, fill=True, alpha=0.3)
-            plt.title('Duration Density (ms)')
+            
+            # 1. Duration Over Time
+            plt.subplot(2, 1, 1)
+            for operation in operations:
+                op_data = df[df['operation'] == operation]
+                if len(op_data) > 1:
+                    plt.plot(op_data.index, op_data['duration_ms'],
+                           label=operation, alpha=0.6,
+                           color=self._get_operation_color(operation))
+            plt.title(f'{component.title()} Duration Over Time')
+            plt.xlabel('Operation Index')
+            plt.ylabel('Duration (ms)')
             plt.legend()
             
-            # 3. ECDF Plot
-            plt.subplot(2, 2, 3)
-            if len(operations) == 1:
-                op_data = df[df['operation'] == operations[0]]
-                sns.ecdfplot(data=op_data, x='duration_ms',
-                           color='#e34a33',
-                           label=operations[0])
-            else:
-                for operation in operations:
-                    op_data = df[df['operation'] == operation]
-                    if len(op_data) > 1:
-                        sns.ecdfplot(data=op_data, x='duration_ms',
-                                   color=self._get_operation_color(operation),
-                                   label=operation)
-            plt.title('Duration Distribution (Cumulative) (ms)')
-            plt.legend()
-            
-            # 4. Bar Plot with Error Bars
-            plt.subplot(2, 2, 4)
-            if len(operations) == 1:
-                sns.barplot(data=df, x='operation', y='duration_ms',
-                          color='#e34a33',
-                          errorbar=('ci', 95))
-            else:
-                df_melted = df.copy()
-                df_melted['hue'] = df_melted['operation']
-                sns.barplot(data=df_melted, x='operation', y='duration_ms',
-                          hue='hue', legend=False,
-                          palette=dict(zip(df['operation'].unique(),
-                                         self._get_operation_colors(df['operation'].unique()))),
-                          errorbar=('ci', 95))
-            plt.title('Mean Duration with 95% CI (ms)')
+            # 2. Box Plot of Duration
+            plt.subplot(2, 1, 2)
+            sns.boxplot(data=df, x='operation', y='duration_ms',
+                       palette=self.colors)
+            plt.title('Duration Distribution')
             plt.xticks(rotation=45)
+            plt.ylabel('Duration (ms)')
             
+            # Save plot
             plt.tight_layout()
-            if plot_dir:
-                plt.savefig(plot_dir / f'{component}_duration_dist.png',
-                           dpi=300, bbox_inches='tight')
+            output_path = os.path.join(plot_dir, f"{component}_duration.png")
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close()
             
         except Exception as e:
-            print(f"Error plotting duration distributions: {str(e)}")
+            logger.error(f"Error plotting duration distributions: {e}")
             plt.close()
     
     def _plot_throughput_variations(self, df, component, plot_dir):
-        """Generate throughput visualization plots."""
+        """Generate throughput variation plots."""
         try:
+            if len(df) < 2:
+                logger.warning(f"Not enough data points for {component} throughput plots")
+                return
+                
             plt.figure(figsize=(15, 8))
             operations = df['operation'].unique()
             
-            # 1. Line Plot with Rolling Mean
-            plt.subplot(2, 2, 1)
-            if len(operations) == 1:
-                op_data = df[df['operation'] == operations[0]]
-                plt.plot(op_data.index, op_data['throughput'].rolling(window=20, min_periods=1).mean(),
-                        color='#e34a33', label=operations[0], linewidth=2)
-            else:
-                colors = self._get_operation_colors(operations)
-                for i, operation in enumerate(operations):
-                    op_data = df[df['operation'] == operation]
-                    if not op_data.empty:
-                        plt.plot(op_data.index, op_data['throughput'].rolling(window=20, min_periods=1).mean(),
-                                color=colors[i], label=operation, linewidth=2)
-            plt.title('Throughput Over Time (samples/sec)')
+            # 1. Throughput Over Time
+            plt.subplot(2, 1, 1)
+            for operation in operations:
+                op_data = df[df['operation'] == operation]
+                if len(op_data) > 1:
+                    plt.plot(op_data.index, op_data['throughput'],
+                           label=operation, alpha=0.6,
+                           color=self._get_operation_color(operation))
+            plt.title(f'{component.title()} Throughput Over Time')
+            plt.xlabel('Operation Index')
             plt.ylabel('Throughput (samples/sec)')
             plt.legend()
-            plt.grid(True, alpha=0.3)
             
-            # 2. Distribution Plot
-            plt.subplot(2, 2, 2)
-            if len(operations) == 1:
-                op_data = df[df['operation'] == operations[0]]
-                sns.kdeplot(data=op_data['throughput'],
-                          color='#e34a33',
-                          label=operations[0], fill=True, alpha=0.5)
-            else:
-                colors = self._get_operation_colors(operations)
-                for i, operation in enumerate(operations):
-                    op_data = df[df['operation'] == operation]
-                    if len(op_data) > 1:
-                        sns.kdeplot(data=op_data['throughput'],
-                                  color=colors[i],
-                                  label=operation, fill=True, alpha=0.3)
-            plt.title('Throughput Distribution (samples/sec)')
-            plt.xlabel('Throughput (samples/sec)')
-            plt.ylabel('Density')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            
-            # 3. Box Plot
-            plt.subplot(2, 2, 3)
-            if len(operations) == 1:
-                sns.boxplot(data=df, x='operation', y='throughput',
-                          color='#e34a33')
-            else:
-                df_melted = df.copy()
-                df_melted['hue'] = df_melted['operation']
-                sns.boxplot(data=df_melted, x='operation', y='throughput',
-                          hue='hue', legend=False,
-                          palette=dict(zip(operations, colors)))
-            plt.title('Throughput Range (samples/sec)')
-            plt.ylabel('Throughput (samples/sec)')
+            # 2. Box Plot of Throughput
+            plt.subplot(2, 1, 2)
+            sns.boxplot(data=df, x='operation', y='throughput',
+                       palette=self.colors)
+            plt.title('Throughput Distribution')
             plt.xticks(rotation=45)
-            plt.grid(True, alpha=0.3)
-            
-            # 4. Bar Plot
-            plt.subplot(2, 2, 4)
-            if len(operations) == 1:
-                sns.barplot(data=df, x='operation', y='throughput',
-                          color='#e34a33',
-                          errorbar=('ci', 95))
-            else:
-                df_melted = df.copy()
-                df_melted['hue'] = df_melted['operation']
-                sns.barplot(data=df_melted, x='operation', y='throughput',
-                          hue='hue', legend=False,
-                          palette=dict(zip(operations, colors)),
-                          errorbar=('ci', 95))
-            plt.title('Mean Throughput with 95% CI (samples/sec)')
             plt.ylabel('Throughput (samples/sec)')
-            plt.xticks(rotation=45)
-            plt.grid(True, alpha=0.3)
             
+            # Save plot
             plt.tight_layout()
-            if plot_dir:
-                plt.savefig(plot_dir / f'{component}_throughput.png',
-                           dpi=300, bbox_inches='tight')
+            output_path = os.path.join(plot_dir, f"{component}_throughput.png")
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close()
             
         except Exception as e:
-            print(f"Error plotting throughput variations: {str(e)}")
+            logger.error(f"Error plotting throughput variations: {e}")
             plt.close()
     
     def _plot_memory_usage(self, df, component, plot_dir):
-        """Generate memory usage visualization plots."""
-        if 'memory_mb' not in df.columns:
-            return
-            
+        """Generate memory usage plots."""
         try:
+            if len(df) < 2:
+                logger.warning(f"Not enough data points for {component} memory plots")
+                return
+                
             plt.figure(figsize=(15, 8))
             operations = df['operation'].unique()
             
-            # 1. Line Plot with Rolling Mean
-            plt.subplot(2, 2, 1)
-            if len(operations) == 1:
-                op_data = df[df['operation'] == operations[0]]
-                plt.plot(op_data.index, op_data['memory_mb'].rolling(window=20, min_periods=1).mean(),
-                        color='#e34a33', label=operations[0], linewidth=2)
-            else:
-                for i, operation in enumerate(operations):
-                    op_data = df[df['operation'] == operation]
-                    if not op_data.empty:
-                        plt.plot(op_data.index, op_data['memory_mb'].rolling(window=20, min_periods=1).mean(),
-                                color=self._get_operation_color(operation), label=operation)
-            plt.title('Memory Usage Over Time')
+            # 1. Memory Usage Over Time
+            plt.subplot(2, 1, 1)
+            for operation in operations:
+                op_data = df[df['operation'] == operation]
+                if len(op_data) > 1:
+                    plt.plot(op_data.index, op_data['memory_mb'],
+                           label=operation, alpha=0.6,
+                           color=self._get_operation_color(operation))
+            plt.title(f'{component.title()} Memory Usage Over Time')
+            plt.xlabel('Operation Index')
+            plt.ylabel('Memory Usage (MB)')
             plt.legend()
-            plt.grid(True, alpha=0.3)
             
-            # 2. KDE Plot
-            plt.subplot(2, 2, 2)
-            if len(operations) == 1:
-                op_data = df[df['operation'] == operations[0]]
-                sns.kdeplot(data=op_data['memory_mb'],
-                          color='#e34a33',
-                          label=operations[0], fill=True, alpha=0.5)
-            else:
-                for i, operation in enumerate(operations):
-                    op_data = df[df['operation'] == operation]
-                    if len(op_data) > 1:
-                        sns.kdeplot(data=op_data['memory_mb'],
-                                  color=self._get_operation_color(operation),
-                                  label=operation, fill=True, alpha=0.3)
+            # 2. Box Plot of Memory Usage
+            plt.subplot(2, 1, 2)
+            sns.boxplot(data=df, x='operation', y='memory_mb',
+                       palette=self.colors)
             plt.title('Memory Usage Distribution')
-            plt.legend()
+            plt.xticks(rotation=45)
+            plt.ylabel('Memory Usage (MB)')
             
-            # 3. Stacked Area Plot
-            plt.subplot(2, 2, 3)
-            if len(operations) == 1:
-                op_data = df[df['operation'] == operations[0]]['memory_mb'].rolling(window=20, min_periods=1).mean()
-                plt.fill_between(df.index, op_data, color='#e34a33', alpha=0.7, label=operations[0])
-            else:
-                data = []
-                for op in operations:
-                    op_data = df[df['operation'] == op]['memory_mb'].rolling(window=20, min_periods=1).mean()
-                    data.append(op_data)
-                plt.stackplot(df.index, data, labels=operations, colors=self._get_operation_colors(operations), alpha=0.7)
-            plt.title('Cumulative Memory Usage')
-            plt.legend()
-            
-            # 4. Memory Usage Percentiles
-            plt.subplot(2, 2, 4)
-            percentiles = [25, 50, 75, 90, 95, 99]
-            if len(operations) == 1:
-                op_data = df[df['operation'] == operations[0]]
-                if not op_data.empty:
-                    perc_values = [np.percentile(op_data['memory_mb'], p) for p in percentiles]
-                    plt.plot(percentiles, perc_values, 'o-',
-                            color='#e34a33',
-                            label=operations[0], linewidth=2, markersize=8)
-            else:
-                for i, operation in enumerate(operations):
-                    op_data = df[df['operation'] == operation]
-                    if not op_data.empty:
-                        perc_values = [np.percentile(op_data['memory_mb'], p) for p in percentiles]
-                        plt.plot(percentiles, perc_values, 'o-',
-                                color=self._get_operation_color(operation),
-                                label=operation, linewidth=2, markersize=8)
-            plt.title('Memory Usage Percentiles')
-            plt.xlabel('Percentile')
-            plt.ylabel('Memory (MB)')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            
+            # Save plot
             plt.tight_layout()
-            if plot_dir:
-                plt.savefig(plot_dir / f'{component}_memory.png',
-                           dpi=300, bbox_inches='tight')
+            output_path = os.path.join(plot_dir, f"{component}_memory.png")
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close()
             
         except Exception as e:
-            print(f"Error plotting memory usage: {str(e)}")
+            logger.error(f"Error plotting memory usage: {e}")
             plt.close()
     
     def _plot_correlation_heatmap(self, df, component, plot_dir):

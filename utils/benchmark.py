@@ -6,97 +6,91 @@ import os
 import json
 import time
 import threading
+import psutil
 from pathlib import Path
 from typing import Dict, Any, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 import gc
+import queue
+from utils.logger import get_logger
+
+# Use existing logger
+logger = get_logger(__name__, console_output=False)
+
+# Cache for system metrics to avoid frequent calls
+_last_cpu_check = 0
+_last_cpu_value = 0
+_CPU_CHECK_INTERVAL = 1.0  # Only check CPU usage every second
+
+def get_cpu_usage():
+    """Get CPU usage with caching to reduce system calls."""
+    global _last_cpu_check, _last_cpu_value
+    now = time.time()
+    if now - _last_cpu_check > _CPU_CHECK_INTERVAL:
+        _last_cpu_value = psutil.cpu_percent()
+        _last_cpu_check = now
+    return _last_cpu_value
 
 @dataclass
 class BenchmarkMetrics:
     """Core metrics for benchmarking."""
+    id: str
     timestamp: float
     operation: str
     duration_ms: float
-    data_size: int  # Size of data processed (e.g., samples, bytes)
-    memory_mb: float  # Memory used for operation
-    throughput: float  # Data processed per second
-    context: Dict[str, Any]  # Additional context-specific metrics
+    data_size: int
+    memory_mb: float
+    throughput: float
+    cpu_usage: float
+    gpu_utilization: Optional[float] = None
+    peak_memory_mb: Optional[float] = None
+    queue_size: Optional[int] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+    
+    # Simplified validation rules
+    VALIDATION_RULES = {
+        "finalize": lambda m: m.data_size >= 8000 and m.duration_ms > 0,
+        "inference": lambda m: m.duration_ms > 0,
+        "process": lambda m: m.duration_ms > 0 and m.data_size >= 500
+    }
     
     def validate(self) -> bool:
-        """Validate metrics before recording."""
-        # Basic validation
-        if self.duration_ms < 0:
+        """Simplified validation with basic checks only."""
+        if self.duration_ms < 0 or self.memory_mb < 0:
             return False
-        if self.memory_mb < 0:
+        rule = self.VALIDATION_RULES.get(self.operation)
+        if rule and not rule(self):
             return False
-            
-        # Operation-specific validation
-        if self.operation == "finalize":
-            # Finalize should have at least 0.5 seconds of audio
-            if self.data_size < 8000:  # 16kHz * 0.5s
-                return False
-            # Context should include text length
-            if "final_text_length" not in self.context:
-                return False
-        elif self.operation == "inference":
-            # Check component through context
-            if "voice_probability" in self.context:
-                # VAD inference - allow multiples of 512 up to 4096
-                if self.data_size < 500 or self.data_size > 4200:
-                    return False
-                if self.data_size % 512 > 50:  # Allow some flexibility
-                    return False
-            else:
-                # Whisper inference expects ~1 second chunks
-                if not (15000 <= self.data_size <= 17000):
-                    return False
-        elif self.operation == "process":
-            # VAD process uses 512-sample chunks or 4096 for system audio
-            # Audio process uses 1024-sample chunks
-            # Whisper process uses 16000-sample chunks
-            if self.data_size < 500:
-                return False
-            
-            # Check for standard chunk sizes with 10% tolerance
-            standard_chunks = [512, 1024, 4096, 16000]
-            chunk_valid = False
-            for chunk_size in standard_chunks:
-                if abs(self.data_size - chunk_size) <= chunk_size * 0.1:
-                    chunk_valid = True
-                    break
-            if not chunk_valid and "chunk_size" not in self.context:
-                return False
-            
         return True
 
 class ComponentBenchmark:
     """Handles benchmarking for a specific component."""
     
-    def __init__(self, component_name: str, benchmark_dir: str = "benchmarks"):
+    def __init__(self, component_name: str, benchmark_dir: str = "benchmarks", batch_size: int = 100):
         self.component_name = component_name
         self.benchmark_dir = Path(benchmark_dir)
-        self.benchmark_dir.mkdir(parents=True, exist_ok=True)
+        self._batch_size = batch_size
+        self._lock = threading.Lock()
+        self._operation_counts = {}
+        self._is_running = True
+        self._buffer = []
+        self._entry_queue = queue.Queue(maxsize=1000)  # Limit queue size
         
-        # Create component-specific directory
+        # Create directories and file
+        self.benchmark_dir.mkdir(parents=True, exist_ok=True)
         self.component_dir = self.benchmark_dir / component_name
         self.component_dir.mkdir(exist_ok=True)
-        
-        # Create new benchmark file for this session
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.benchmark_file = self.component_dir / f"benchmark_{timestamp}.jsonl"
         
-        self._lock = threading.Lock()
-        self._operation_counts = {}  # Track operation counts
-        
-        # Write header with system info
         self._write_header()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
     
     def _write_header(self):
-        """Write benchmark file header with system information."""
+        """Write benchmark file header."""
         import platform
-        import psutil
-        
         header = {
             "timestamp": time.time(),
             "type": "header",
@@ -105,35 +99,59 @@ class ComponentBenchmark:
                 "processor": platform.processor(),
                 "cpu_count": psutil.cpu_count(),
                 "memory_total": psutil.virtual_memory().total,
-                "component": self.component_name
+                "component": self.component_name,
+                "batch_size": self._batch_size
             }
         }
-        
-        self._write_entry(header)
+        with open(self.benchmark_file, 'a', encoding='utf-8') as f:
+            json.dump(header, f)
+            f.write('\n')
+    
+    def _writer_loop(self):
+        """Background thread for batch writing entries."""
+        while self._is_running or not self._entry_queue.empty():
+            try:
+                # Get next entry with timeout
+                entry = self._entry_queue.get(timeout=1.0)
+                self._buffer.append(entry)
+                
+                # Flush if buffer is full
+                if len(self._buffer) >= self._batch_size:
+                    self._flush_buffer()
+                    
+            except queue.Empty:
+                if self._buffer:
+                    self._flush_buffer()
+                continue
+            except Exception as e:
+                logger.error(f"Error in writer thread: {e}")
+    
+    def _flush_buffer(self):
+        """Write buffered entries to file."""
+        if not self._buffer:
+            return
+        try:
+            with open(self.benchmark_file, 'a', encoding='utf-8') as f:
+                for entry in self._buffer:
+                    json.dump(entry, f)
+                    f.write('\n')
+            self._buffer.clear()
+        except Exception as e:
+            logger.error(f"Error flushing buffer: {e}")
     
     def _write_entry(self, entry: Dict[str, Any]):
-        """Thread-safe write of a benchmark entry."""
-        with self._lock:
-            with open(self.benchmark_file, 'a', encoding='utf-8') as f:
-                json.dump(entry, f)
-                f.write('\n')
+        """Queue an entry for writing."""
+        try:
+            self._entry_queue.put_nowait(entry)
+        except queue.Full:
+            pass  # Drop metrics if queue is full
     
     def record_metric(self, metrics: BenchmarkMetrics):
-        """Record a benchmark metric with validation."""
-        # Validate metrics
+        """Record a benchmark metric."""
         if not metrics.validate():
-            self.record_event("invalid_metric", {
-                "operation": metrics.operation,
-                "duration_ms": metrics.duration_ms,
-                "data_size": metrics.data_size,
-                "context": metrics.context
-            })
             return
-            
-        # Update operation count
         with self._lock:
             self._operation_counts[metrics.operation] = self._operation_counts.get(metrics.operation, 0) + 1
-        
         entry = {
             "timestamp": metrics.timestamp,
             "type": "metric",
@@ -142,7 +160,7 @@ class ComponentBenchmark:
         self._write_entry(entry)
     
     def record_event(self, event_type: str, details: Dict[str, Any]):
-        """Record a significant event or error."""
+        """Record a significant event."""
         entry = {
             "timestamp": time.time(),
             "type": "event",
@@ -152,9 +170,16 @@ class ComponentBenchmark:
         self._write_entry(entry)
     
     def get_stats(self) -> Dict[str, int]:
-        """Get current operation counts."""
+        """Get operation counts."""
         with self._lock:
             return self._operation_counts.copy()
+    
+    def close(self):
+        """Shut down the writer thread."""
+        self._is_running = False
+        if self._writer_thread.is_alive():
+            self._writer_thread.join(timeout=5.0)
+        self._flush_buffer()
 
 def get_memory_usage() -> float:
     """Get current memory usage in MB."""
@@ -164,9 +189,9 @@ def get_memory_usage() -> float:
     return max(0, memory_info.rss / (1024 * 1024))  # Return RSS in MB, ensure non-negative
 
 class BenchmarkContext:
-    """Context manager for easy benchmarking of code blocks."""
+    """Context manager for benchmarking."""
     
-    def __init__(self, benchmark: ComponentBenchmark, operation: str, data_size: int = 0, 
+    def __init__(self, benchmark, operation: str, data_size: int = 0, 
                  context: Optional[Dict[str, Any]] = None):
         self.benchmark = benchmark
         self.operation = operation
@@ -176,41 +201,39 @@ class BenchmarkContext:
         self.start_memory = None
     
     def __enter__(self):
+        if self.benchmark is None:
+            return self
         self.start_time = time.perf_counter()
         self.start_memory = get_memory_usage()
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.benchmark is None:
+            return True
         if exc_type is not None:
             self.benchmark.record_event("error", {
                 "operation": self.operation,
-                "error": str(exc_val),
-                "type": exc_type.__name__
+                "error": str(exc_val)
             })
             return False
+            
+        # Quick time and memory calculations
+        duration = (time.perf_counter() - self.start_time) * 1000
+        memory_delta = max(0, get_memory_usage() - self.start_memory)
         
-        duration = (time.perf_counter() - self.start_time) * 1000  # Convert to ms
-        end_memory = get_memory_usage()
-        memory_delta = max(0, end_memory - self.start_memory)  # Ensure non-negative delta
+        # Simple throughput calculation
+        throughput = (self.data_size / duration) * 1000 if duration > 0.1 and self.data_size > 0 else 0
         
-        # Calculate throughput (data processed per second)
-        # Only calculate if duration is significant and data_size is non-zero
-        if duration > 0.1 and self.data_size > 0:  # Minimum 0.1ms duration
-            throughput = (self.data_size / duration) * 1000
-        else:
-            throughput = 0
-        
-        # Add operation count to context
-        stats = self.benchmark.get_stats()
-        self.context["operation_count"] = stats.get(self.operation, 0)
-        
+        # Create metrics with minimal system calls
         metrics = BenchmarkMetrics(
+            id=str(time.time()),
             timestamp=time.time(),
             operation=self.operation,
             duration_ms=duration,
             data_size=self.data_size,
             memory_mb=memory_delta,
             throughput=throughput,
+            cpu_usage=get_cpu_usage(),  # Use cached CPU value
             context=self.context
         )
         

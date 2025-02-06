@@ -21,6 +21,7 @@ import psutil
 import queue
 from collections import deque
 from colorama import Fore, Style
+import signal
 
 # Import pipeline and models after other imports
 from pipeline import StreamingPipeline
@@ -31,12 +32,16 @@ from utils.logger import configure_logging, get_logger
 configure_logging(log_file="main.log", console_output=False)
 logger = get_logger("pipeline_ui", log_file="main.log", console_output=False)
 
-# Disable other loggers from printing to console
-logging.getLogger("faster_whisper").setLevel(logging.ERROR)
-logging.getLogger("models.diarization").setLevel(logging.ERROR)
+# Ensure SpeechBrain messages are suppressed
 logging.getLogger("speechbrain").setLevel(logging.ERROR)
-logging.getLogger("pyannote").setLevel(logging.ERROR)
-logging.getLogger("pipeline").setLevel(logging.ERROR)
+logging.getLogger("speechbrain.utils.quirks").setLevel(logging.ERROR)
+logging.getLogger("speechbrain.utils.autocast").setLevel(logging.ERROR)
+
+# Allow other important messages
+logging.getLogger("faster_whisper").setLevel(logging.INFO)
+logging.getLogger("models.diarization").setLevel(logging.INFO)
+logging.getLogger("pyannote").setLevel(logging.INFO)
+logging.getLogger("pipeline").setLevel(logging.INFO)
 
 # Add at top of file, after imports
 MODEL_THRESHOLDS = {
@@ -594,8 +599,27 @@ def format_vad(pipeline) -> Group:
         format_vad.display = VADDisplay()
     return format_vad.display.get_renderable(pipeline)
 
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully."""
+    print("\nReceived interrupt signal. Cleaning up...")
+    try:
+        pipeline = globals().get('pipeline')
+        if pipeline:
+            pipeline.cleanup()
+        system_monitor = globals().get('system_monitor')
+        if system_monitor:
+            system_monitor.stop()
+    except:
+        pass
+    print("Cleanup complete. Exiting...")
+    sys.exit(0)
+
 def main():
     """Main entry point."""
+    # Set up signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # Create parser first
     parser = argparse.ArgumentParser(
         description="Whisper Streaming Transcription UI",
@@ -687,24 +711,40 @@ def main():
         "Initializing...",
         "Loading...",
         ("Starting up...", ""),
-        format_vad(pipeline)
+        vad_display.get_renderable(pipeline)
     )
+    
+    # Pretty initialization message
+    print(f"\n{Fore.CYAN}╔══════════════════════════════════════╗")
+    print(f"║      {Fore.GREEN}Whisper Streaming Setup{Fore.CYAN}         ║")
+    print(f"╚══════════════════════════════════════╝{Style.RESET_ALL}\n")
+    
+    # Countdown with prettier formatting
+    print(f"{Fore.CYAN}┌─ {Fore.GREEN}Preparing UI{Fore.CYAN} ─┐")
+    for i in range(5, 0, -1):
+        print(f"{Fore.CYAN}│  {Fore.GREEN}Loading in {i}{Fore.CYAN}  │")
+        time.sleep(1)
+    print(f"{Fore.CYAN}└─────────────────┘{Style.RESET_ALL}\n")
     
     # Start audio processing in background based on input source
     if args.use_mic:
-        print(f"\n{Fore.CYAN}=== Starting Whisper Streaming UI ===")
-        print(f"Input Source: {Fore.GREEN}Microphone{Style.RESET_ALL}")
-        print(f"Model: {Fore.GREEN}{args.model}{Style.RESET_ALL}")
-        print(f"Compute Type: {Fore.GREEN}{args.compute_type}{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}==================================={Style.RESET_ALL}\n")
+        print(f"{Fore.CYAN}╔═══════════════════════════════════╗")
+        print(f"║  {Fore.GREEN}Whisper Streaming Transcription{Fore.CYAN}  ║")
+        print(f"╠═══════════════════════════════════╣")
+        print(f"║  Input: {Fore.GREEN}Microphone{Fore.CYAN}                ║")
+        print(f"║  Model: {Fore.GREEN}{args.model:<24}{Fore.CYAN}║")
+        print(f"║  Mode:  {Fore.GREEN}{args.compute_type:<24}{Fore.CYAN}║")
+        print(f"╚═══════════════════════════════════╝{Style.RESET_ALL}\n")
         mic_thread = threading.Thread(target=pipeline.process_microphone, daemon=True)
         mic_thread.start()
     elif args.use_system_audio:
-        print(f"\n{Fore.CYAN}=== Starting Whisper Streaming UI ===")
-        print(f"Input Source: {Fore.GREEN}System Audio{Style.RESET_ALL}")
-        print(f"Model: {Fore.GREEN}{args.model}{Style.RESET_ALL}")
-        print(f"Compute Type: {Fore.GREEN}{args.compute_type}{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}==================================={Style.RESET_ALL}\n")
+        print(f"{Fore.CYAN}╔═══════════════════════════════════╗")
+        print(f"║  {Fore.GREEN}Whisper Streaming Transcription{Fore.CYAN}  ║")
+        print(f"╠═══════════════════════════════════╣")
+        print(f"║  Input: {Fore.GREEN}System Audio{Fore.CYAN}              ║")
+        print(f"║  Model: {Fore.GREEN}{args.model:<24}{Fore.CYAN}║")
+        print(f"║  Mode:  {Fore.GREEN}{args.compute_type:<24}{Fore.CYAN}║")
+        print(f"╚═══════════════════════════════════╝{Style.RESET_ALL}\n")
         audio_thread = threading.Thread(target=pipeline.process_system_audio, daemon=True)
         audio_thread.start()
     else:
@@ -725,7 +765,7 @@ def main():
                     format_transcript(pipeline.live_transcript),
                     format_history(pipeline),
                     format_status(pipeline, system_monitor),
-                    format_vad(pipeline)
+                    vad_display.get_renderable(pipeline)
                 )
                 live.update(layout)
                 
@@ -742,4 +782,10 @@ def main():
             pipeline.cleanup()
 
 if __name__ == "__main__":
-    main() 
+    try:
+        main()
+    except KeyboardInterrupt:
+        signal_handler(None, None)
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+        signal_handler(None, None) 

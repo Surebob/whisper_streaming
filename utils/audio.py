@@ -12,6 +12,10 @@ from functools import lru_cache
 from typing import Optional, Tuple, Callable, Union
 from models.stats import PipelineStats
 from utils.benchmark import ComponentBenchmark, BenchmarkContext
+from utils.logger import get_logger
+
+# Initialize logger
+logger = get_logger(__name__, console_output=False)
 
 # Initialize component benchmark
 _benchmark = ComponentBenchmark("audio")
@@ -34,23 +38,23 @@ def create_audio_stream(callback: Callable, use_system_audio: bool = False) -> U
             
             # Get default speakers
             default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-            print(f"\nDefault Output Device: {default_speakers['name']}")
+            logger.info(f"Default Output Device: {default_speakers['name']}")
             
             # Find loopback device
             loopback_device = None
             for device_index in range(p.get_device_count()):
                 device_info = p.get_device_info_by_index(device_index)
                 if device_info.get('isLoopbackDevice', False):
-                    print(f"Found loopback device: {device_info['name']}")
+                    logger.info(f"Found loopback device: {device_info['name']}")
                     loopback_device = device_info
                     break
             
             if not loopback_device:
                 raise RuntimeError("No loopback device found")
             
-            print(f"Recording from: {loopback_device['name']}")
-            print(f"Sample Rate: {int(loopback_device['defaultSampleRate'])}Hz")
-            print(f"Channels: {loopback_device['maxInputChannels']}")
+            logger.info(f"Recording from: {loopback_device['name']}")
+            logger.info(f"Sample Rate: {int(loopback_device['defaultSampleRate'])}Hz")
+            logger.info(f"Channels: {loopback_device['maxInputChannels']}")
             
             def wrapped_callback(in_data, frame_count, time_info, status):
                 """Wrapper callback to handle audio format conversion."""
@@ -80,7 +84,7 @@ def create_audio_stream(callback: Callable, use_system_audio: bool = False) -> U
                     return (None, pyaudio.paContinue)
                     
                 except Exception as e:
-                    print(f"Error in audio callback: {e}")
+                    logger.error(f"Error in audio callback: {e}")
                     return (None, pyaudio.paComplete)
             
             # Create stream for system audio
@@ -104,7 +108,7 @@ def create_audio_stream(callback: Callable, use_system_audio: bool = False) -> U
             default_input = sd.query_devices(kind='input')
             device_index = default_input['index']
             device_name = default_input['name']
-            print(f"Using microphone device: {device_name}")
+            logger.info(f"Using microphone device: {device_name}")
             
             # Create stream for microphone
             stream = sd.InputStream(

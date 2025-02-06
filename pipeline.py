@@ -19,6 +19,7 @@ from utils.cli import parse_args
 from utils.benchmark import ComponentBenchmark, BenchmarkContext
 from utils.audio import create_audio_stream
 import pyaudio
+from models.init import ModelManager
 
 # Import from models
 from models.vad import VADModel
@@ -70,7 +71,7 @@ class StreamingPipeline:
         self.running = True
         self.is_speaking = False
         self.silence_start = None
-        self.silence_threshold = 2.0  # seconds
+        self.silence_threshold = 1.5  # seconds
         self.current_speaker = None
         self.live_transcript = ""  # For live display
         self.current_segment = ""  # Buffer for current speech segment
@@ -118,12 +119,12 @@ class StreamingPipeline:
             self.min_chunk_size = min_chunk_size
             self.batch_size = batch_size
             
-            # Disable logging to console for certain modules
-            logging.getLogger("faster_whisper").setLevel(logging.ERROR)
-            logging.getLogger("models.diarization").setLevel(logging.ERROR)
-            
-            # Initialize components
+            # Initialize models using ModelManager
             self._init_models()
+            
+            # Enable benchmarking for diarization if requested
+            if enable_benchmark:
+                self.diarization.enable_benchmark(True)
             
             logger.info(f"{Fore.GREEN}Pipeline initialized successfully{Style.RESET_ALL}")
         except Exception as e:
@@ -131,79 +132,24 @@ class StreamingPipeline:
             raise
     
     def _init_models(self):
-        """Initialize all models."""
-        logger.info(f"{Fore.CYAN}Initializing models...{Style.RESET_ALL}")
-        
-        # Initialize VAD
-        self.vad_model = VADModel(
-            sampling_rate=SAMPLING_RATE,
-            device="cuda" if torch.cuda.is_available() else "cpu"
-        )
-        
-        # Initialize Whisper exactly like in stream_whisper.py
-        print(f"{Fore.GREEN}Initializing model {self.model_name}...{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}Language set to: {self.language}{Style.RESET_ALL}")
-        
-        self.asr = FasterWhisperASR(
-            lan=self.language,
-            modelsize=self.model_name,
+        """Initialize all models using ModelManager."""
+        model_manager = ModelManager(
+            model_name=self.model_name,
+            language=self.language,
+            compute_type=self.compute_type,
             batch_size=self.batch_size
         )
         
-        # Verify language setting
-        print(f"{Fore.YELLOW}Verifying language setting: {self.asr.original_language}{Style.RESET_ALL}")
-        
-        # Override the default model initialization with our compute type
-        base_model = WhisperModel(
-            self.model_name,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            compute_type=self.compute_type,
-            download_root=None,
-            num_workers=2,
-            cpu_threads=4
-        )
-        self.asr.model = base_model
-        self.asr.batch_model = BatchedInferencePipeline(model=base_model)
-        
-        # Initialize streaming processor
-        self.processor = OnlineASRProcessor(
-            self.asr,
-            buffer_trimming=("segment", 15.0)
-        )
-        
-        # Warm up the model with dummy audio
-        print(f"{Fore.YELLOW}Warming up model...{Style.RESET_ALL}")
         try:
-            # Try to load warmup file if it exists
-            warmup_file = "warmup.wav"
-            if os.path.exists(warmup_file):
-                warmup_audio = load_audio_chunk(warmup_file, 0, 5)  # Load first 5 seconds
-                print(f"{Fore.GREEN}Using warmup file: {warmup_file}{Style.RESET_ALL}")
-            else:
-                # Generate synthetic audio for warmup
-                print(f"{Fore.YELLOW}Using synthetic audio for warmup{Style.RESET_ALL}")
-                warmup_audio = np.zeros(16000 * 5, dtype=np.float32)  # 5 seconds of silence
-                # Add some noise to make it more realistic
-                warmup_audio += np.random.normal(0, 0.01, warmup_audio.shape)
-            
-            self.processor.insert_audio_chunk(warmup_audio)
-            self.processor.process_iter()  # Process it silently
-            
-            # Reset processor after warmup with same settings
-            self.processor = OnlineASRProcessor(
-                self.asr,
-                buffer_trimming=("segment", 15.0)
-            )
-            print(f"{Fore.GREEN}Warmup complete!{Style.RESET_ALL}")
+            models = model_manager.setup_all()
+            self.vad_model = models["vad"]
+            self.asr = models["asr"]
+            self.processor = models["processor"]
+            self.diarization = models["diarization"]
             
         except Exception as e:
-            logger.warning(f"Error during warmup: {str(e)}, continuing without warmup")
-            # No need to raise the error, we can continue without warmup
-        
-        # Initialize Diarization
-        self.diarization = DiarizationModel(device="cuda" if torch.cuda.is_available() else "cpu")
-        
-        logger.info(f"{Fore.GREEN}All models loaded successfully{Style.RESET_ALL}")
+            logger.error(f"Error initializing models: {str(e)}")
+            raise
     
     def start_processing_threads(self):
         """Start all processing threads."""
@@ -459,7 +405,7 @@ class StreamingPipeline:
             self.stream = create_audio_stream(self._audio_callback, use_system_audio=False)
             
             self.stream.start()
-            print(f"\n{Fore.GREEN}Ready! Listening to microphone input... Press Ctrl+C to stop{Style.RESET_ALL}")
+            logger.info("Ready! Listening to microphone input... Press Ctrl+C to stop")
             
             while self.running:
                 time.sleep(0.1)  # Main thread sleep
@@ -481,7 +427,7 @@ class StreamingPipeline:
             # Create system audio stream (starts automatically)
             self.stream = create_audio_stream(self._audio_callback, use_system_audio=True)
             
-            print(f"\n{Fore.GREEN}Ready! Recording system audio... Press Ctrl+C to stop{Style.RESET_ALL}")
+            logger.info("Ready! Recording system audio... Press Ctrl+C to stop")
             
             while self.running:
                 time.sleep(0.1)  # Main thread sleep
@@ -559,15 +505,14 @@ class StreamingPipeline:
         if hasattr(self, 'executor'):
             self.executor.shutdown(wait=False)
         
-        # Cleanup models
-        if hasattr(self, 'vad_model'):
-            self.vad_model.reset()
-        if hasattr(self, 'diarization'):
-            del self.diarization
-        
-        # Clear CUDA cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Use model manager for cleanup
+        try:
+            model_manager = ModelManager()
+            model_manager.vad_model = self.vad_model
+            model_manager.diarization_model = self.diarization
+            model_manager.cleanup()
+        except Exception as e:
+            logger.error(f"Error during model cleanup: {e}")
 
 def main():
     """Main entry point."""
