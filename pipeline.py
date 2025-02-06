@@ -14,22 +14,20 @@ from colorama import init, Fore, Style
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 import threading
 import queue
+from utils.logger import configure_logging, get_logger
+from utils.cli import parse_args
+from utils.benchmark import ComponentBenchmark, BenchmarkContext
+from utils.audio import create_audio_stream
+import pyaudio
 
 # Import from models
 from models.vad import VADModel
 from models.diarization import DiarizationModel
 from models.stats import ModelStatsMonitor
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("main.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+# Initialize logging
+configure_logging(log_file="main.log", console_output=True)
+logger = get_logger(__name__)
 
 # Suppress warnings but log them to file
 warnings.filterwarnings('ignore')
@@ -57,7 +55,17 @@ CAPTURE_CHUNK_SIZE = 1024  # Stable audio capture size (64ms)
 WHISPER_CHUNK_SIZE = int(SAMPLING_RATE * 1.0)  # 1 second chunks for Whisper
 
 class StreamingPipeline:
-    def __init__(self, model_name="large-v3", language="en", compute_type="int8_float16", min_chunk_size=1.0, batch_size=8):
+    def __init__(self, model_name="large-v3", language="en", compute_type="int8_float16", min_chunk_size=1.0, batch_size=8, enable_benchmark=False):
+        # Initialize benchmark if enabled
+        if enable_benchmark:
+            self.audio_benchmark = ComponentBenchmark("audio")
+            self.vad_benchmark = ComponentBenchmark("vad")
+            self.whisper_benchmark = ComponentBenchmark("whisper")
+        else:
+            self.audio_benchmark = None
+            self.vad_benchmark = None
+            self.whisper_benchmark = None
+        
         # Initialize state tracking
         self.running = True
         self.is_speaking = False
@@ -163,10 +171,21 @@ class StreamingPipeline:
             buffer_trimming=("segment", 15.0)
         )
         
-        # Warm up the model with real audio
-        print(f"{Fore.YELLOW}Warming up model with real audio...{Style.RESET_ALL}")
+        # Warm up the model with dummy audio
+        print(f"{Fore.YELLOW}Warming up model...{Style.RESET_ALL}")
         try:
-            warmup_audio = load_audio_chunk("lex.wav", 0, 5)  # Load first 5 seconds
+            # Try to load warmup file if it exists
+            warmup_file = "warmup.wav"
+            if os.path.exists(warmup_file):
+                warmup_audio = load_audio_chunk(warmup_file, 0, 5)  # Load first 5 seconds
+                print(f"{Fore.GREEN}Using warmup file: {warmup_file}{Style.RESET_ALL}")
+            else:
+                # Generate synthetic audio for warmup
+                print(f"{Fore.YELLOW}Using synthetic audio for warmup{Style.RESET_ALL}")
+                warmup_audio = np.zeros(16000 * 5, dtype=np.float32)  # 5 seconds of silence
+                # Add some noise to make it more realistic
+                warmup_audio += np.random.normal(0, 0.01, warmup_audio.shape)
+            
             self.processor.insert_audio_chunk(warmup_audio)
             self.processor.process_iter()  # Process it silently
             
@@ -176,10 +195,10 @@ class StreamingPipeline:
                 buffer_trimming=("segment", 15.0)
             )
             print(f"{Fore.GREEN}Warmup complete!{Style.RESET_ALL}")
+            
         except Exception as e:
-            print(f"{Fore.YELLOW}Warmup file not found, using dummy audio...{Style.RESET_ALL}")
-            dummy = np.zeros(16000 * 5, dtype=np.float32)  # 5 seconds of silence
-            self.asr.transcribe(dummy)
+            logger.warning(f"Error during warmup: {str(e)}, continuing without warmup")
+            # No need to raise the error, we can continue without warmup
         
         # Initialize Diarization
         self.diarization = DiarizationModel(device="cuda" if torch.cuda.is_available() else "cpu")
@@ -215,69 +234,74 @@ class StreamingPipeline:
                 # Time pipeline processing
                 pipeline_start = time.perf_counter()
                 
-                # Non-blocking get
-                try:
-                    audio_chunk = self.audio_queue.get_nowait()
-                    vad_buffer.extend(audio_chunk)  # Extend instead of append for flat array
-                    whisper_buffer.append(audio_chunk)
-                except queue.Empty:
-                    if len(vad_buffer) == 0:  # Check length directly
-                        time.sleep(0.001)  # Tiny sleep if no data
-                        continue
-                
-                # Process VAD when we have enough data (512 samples)
-                while len(vad_buffer) >= VAD_WINDOW_SIZE:
-                    # Get 512 samples for VAD
-                    vad_audio = vad_buffer[:VAD_WINDOW_SIZE]
-                    vad_buffer = vad_buffer[VAD_WINDOW_SIZE:]  # Keep remainder
+                # Non-blocking get with benchmarking
+                with BenchmarkContext(self.vad_benchmark, "process", 0) as bench:
+                    try:
+                        audio_chunk = self.audio_queue.get_nowait()
+                        vad_buffer.extend(audio_chunk)  # Extend instead of append for flat array
+                        whisper_buffer.append(audio_chunk)
+                        bench.data_size = len(audio_chunk)
+                    except queue.Empty:
+                        if len(vad_buffer) == 0:  # Check length directly
+                            time.sleep(0.001)  # Tiny sleep if no data
+                            continue
                     
-                    # Process VAD with 512-sample window
-                    audio_tensor = torch.from_numpy(np.array(vad_audio)).float().to(device)
-                    if audio_tensor.max() > 1.0 or audio_tensor.min() < -1.0:
-                        audio_tensor = audio_tensor / max(abs(audio_tensor.max()), abs(audio_tensor.min()))
-                    
-                    # Time VAD inference
-                    vad_start = time.perf_counter()
-                    prob = self.vad_model.model(
-                        audio_tensor.unsqueeze(0),  # Add batch dimension
-                        self.vad_model.sampling_rate
-                    ).item()
-                    vad_time = time.perf_counter() - vad_start
-                    
-                    # Update voice probability tracking
-                    self.voice_prob = prob
-                    self.voice_prob_history.append(prob)
-                    
-                    # Record VAD timing
-                    if hasattr(self, 'model_stats'):
-                        self.model_stats.add_stat('vad', vad_time)
-                    
-                    is_speech = prob > 0.5
-                    current_time = time.time()
-                    
-                    # Update state with minimal locking
-                    with self._state_lock:
-                        state = self._vad_state
-                        if is_speech:
-                            # Always reset silence counter when speech is detected
-                            state['silence_start'] = None
-                            self.silence_start = None
-                            
-                            if not state['is_speaking']:
-                                state['is_speaking'] = True
-                                self.is_speaking = True
-                                logger.info("Speech detected")  # Debug log
-                            state['last_update_time'] = current_time
-                        else:
-                            if state['is_speaking']:
-                                if state['silence_start'] is None:
-                                    state['silence_start'] = current_time
-                                    self.silence_start = current_time
-                                    logger.info("Silence started")  # Debug log
-                                elif current_time - state['silence_start'] > self.silence_threshold:
-                                    state['is_speaking'] = False
-                                    self.is_speaking = False
-                                    logger.info("Speech ended")  # Debug log
+                    # Process VAD when we have enough data (512 samples)
+                    while len(vad_buffer) >= VAD_WINDOW_SIZE:
+                        # Get 512 samples for VAD
+                        vad_audio = vad_buffer[:VAD_WINDOW_SIZE]
+                        vad_buffer = vad_buffer[VAD_WINDOW_SIZE:]  # Keep remainder
+                        
+                        # Process VAD with 512-sample window
+                        audio_tensor = torch.from_numpy(np.array(vad_audio)).float().to(device)
+                        if audio_tensor.max() > 1.0 or audio_tensor.min() < -1.0:
+                            audio_tensor = audio_tensor / max(abs(audio_tensor.max()), abs(audio_tensor.min()))
+                        
+                        # Time VAD inference with benchmark
+                        with BenchmarkContext(self.vad_benchmark, "inference", len(vad_audio)) as vad_bench:
+                            prob = self.vad_model.model(
+                                audio_tensor.unsqueeze(0),  # Add batch dimension
+                                self.vad_model.sampling_rate
+                            ).item()
+                            vad_bench.context.update({
+                                "voice_probability": prob,
+                                "is_speech": prob > 0.5
+                            })
+                        
+                        # Update voice probability tracking
+                        self.voice_prob = prob
+                        self.voice_prob_history.append(prob)
+                        
+                        # Record VAD timing
+                        if hasattr(self, 'model_stats'):
+                            self.model_stats.add_stat('vad', time.perf_counter() - pipeline_start)
+                        
+                        is_speech = prob > 0.5
+                        current_time = time.time()
+                        
+                        # Update state with minimal locking
+                        with self._state_lock:
+                            state = self._vad_state
+                            if is_speech:
+                                # Always reset silence counter when speech is detected
+                                state['silence_start'] = None
+                                self.silence_start = None
+                                
+                                if not state['is_speaking']:
+                                    state['is_speaking'] = True
+                                    self.is_speaking = True
+                                    logger.info("Speech detected")  # Debug log
+                                state['last_update_time'] = current_time
+                            else:
+                                if state['is_speaking']:
+                                    if state['silence_start'] is None:
+                                        state['silence_start'] = current_time
+                                        self.silence_start = current_time
+                                        logger.info("Silence started")  # Debug log
+                                    elif current_time - state['silence_start'] > self.silence_threshold:
+                                        state['is_speaking'] = False
+                                        self.is_speaking = False
+                                        logger.info("Speech ended")  # Debug log
                 
                 # Process Whisper when we have enough data (1 second)
                 if whisper_buffer:  # Only process if we have data
@@ -317,51 +341,75 @@ class StreamingPipeline:
                 # Process transcription if speaking
                 with self._state_lock:
                     if self.is_speaking:
-                        # Time Whisper processing
-                        whisper_start = time.perf_counter()
+                        # Time Whisper processing with benchmark
+                        with BenchmarkContext(self.whisper_benchmark, "process", len(audio_chunk), {
+                            "is_speech": is_speech,
+                            "chunk_size": len(audio_chunk)
+                        }) as bench:
+                            # Check buffer size before appending
+                            total_samples = sum(len(chunk) for chunk in self.audio_buffer) + len(audio_chunk)
+                            if total_samples <= self.max_buffer_size:
+                                # Accumulate audio
+                                self.audio_buffer.append(audio_chunk)
+                            else:
+                                logger.warning("Audio buffer full, dropping new audio chunk")
+                            
+                            # Process transcription with benchmark
+                            with BenchmarkContext(self.whisper_benchmark, "inference", len(audio_chunk)) as whisper_bench:
+                                self.processor.insert_audio_chunk(audio_chunk)
+                                result = self.processor.process_iter()
+                                
+                                if result[0] is not None:
+                                    _, _, text = result
+                                    whisper_bench.context.update({
+                                        "text_length": len(text) if text else 0,
+                                        "has_result": result[0] is not None
+                                    })
+                            
+                            if result[0] is not None:
+                                _, _, text = result
+                                if text and isinstance(text, str):
+                                    new_text = text.strip()
+                                    if new_text and not self.live_transcript.endswith(new_text):
+                                        self.live_transcript += " " + new_text
+                                        self.live_transcript = self.live_transcript.strip()
+                                        self.current_segment = self.live_transcript
+                                        bench.context["transcribed_text"] = new_text
                         
-                        # Check buffer size before appending
-                        total_samples = sum(len(chunk) for chunk in self.audio_buffer) + len(audio_chunk)
-                        if total_samples <= self.max_buffer_size:
-                            # Accumulate audio
-                            self.audio_buffer.append(audio_chunk)
-                        else:
-                            logger.warning("Audio buffer full, dropping new audio chunk")
-                        
-                        # Process transcription
-                        self.processor.insert_audio_chunk(audio_chunk)
-                        result = self.processor.process_iter()
-                        
-                        whisper_time = time.perf_counter() - whisper_start
-                        if hasattr(self, 'model_stats'):
-                            self.model_stats.add_stat('whisper', whisper_time)
-                        
-                        if result[0] is not None:
-                            _, _, text = result
-                            if text and isinstance(text, str):
-                                new_text = text.strip()
-                                if new_text and not self.live_transcript.endswith(new_text):
-                                    self.live_transcript += " " + new_text
-                                    self.live_transcript = self.live_transcript.strip()
-                                    self.current_segment = self.live_transcript
-                    
                     # Check if speech just ended
                     elif len(self.audio_buffer) > 0:
-                        segment_audio = np.concatenate(self.audio_buffer)
-                        segment_text = self.current_segment.strip()
-                        if segment_text and segment_text != self.last_processed_text:
-                            self.last_processed_text = segment_text
-                            self.diarization_queue.put((segment_audio, segment_text))
-                        
-                        # Clear buffers
-                        self.audio_buffer = []
-                        self.current_segment = ""
-                        self.live_transcript = ""
-                
+                        with BenchmarkContext(self.whisper_benchmark, "finalize", sum(len(c) for c in self.audio_buffer), {
+                            "final_text_length": len(self.current_segment),
+                            "total_audio_samples": sum(len(c) for c in self.audio_buffer),
+                            "silence_duration": time.time() - self.silence_start if self.silence_start else 0,
+                            "is_valid_segment": len(self.current_segment.strip()) > 0
+                        }) as bench:
+                            segment_audio = np.concatenate(self.audio_buffer)
+                            segment_text = self.current_segment.strip()
+                            
+                            # Only process if we have valid text
+                            if segment_text and segment_text != self.last_processed_text:
+                                self.last_processed_text = segment_text
+                                self.diarization_queue.put((segment_audio, segment_text))
+                                bench.context.update({
+                                    "final_text_length": len(segment_text),
+                                    "total_audio_samples": len(segment_audio),
+                                    "words_per_second": len(segment_text.split()) / (len(segment_audio) / SAMPLING_RATE)
+                                })
+                            
+                            # Clear buffers
+                            self.audio_buffer = []
+                            self.current_segment = ""
+                            self.live_transcript = ""
+            
             except queue.Empty:
                 continue
             except Exception as e:
                 logger.error(f"Error in transcription processing: {str(e)}")
+                self.whisper_benchmark.record_event("error", {
+                    "operation": "transcription",
+                    "error": str(e)
+                })
     
     def _diarization_processing_loop(self):
         """Continuous diarization processing loop."""
@@ -402,34 +450,16 @@ class StreamingPipeline:
     def process_microphone(self):
         """Process audio from microphone input."""
         try:
-            logger.info(f"{Fore.CYAN}Starting microphone processing...{Style.RESET_ALL}")
+            logger.info("Starting microphone processing...")
             
             # Start processing threads
             self.start_processing_threads()
             
-            def audio_callback(indata, frames, time, status):
-                if status and not status.input_overflow:
-                    return
-                
-                # Put audio chunk in queue without blocking
-                try:
-                    self.audio_queue.put_nowait(indata[:, 0].astype(np.float32))
-                except queue.Full:
-                    # Drop frame if queue is full
-                    pass
-            
-            # Create stream with stable chunk size
-            self.stream = sd.InputStream(
-                channels=1,
-                samplerate=SAMPLING_RATE,
-                blocksize=CAPTURE_CHUNK_SIZE,  # Use larger chunks for stable capture
-                dtype=np.float32,
-                callback=audio_callback,
-                latency='low'
-            )
+            # Create microphone stream
+            self.stream = create_audio_stream(self._audio_callback, use_system_audio=False)
             
             self.stream.start()
-            print(f"{Fore.GREEN}Listening... Press Ctrl+C to stop{Style.RESET_ALL}")
+            print(f"\n{Fore.GREEN}Ready! Listening to microphone input... Press Ctrl+C to stop{Style.RESET_ALL}")
             
             while self.running:
                 time.sleep(0.1)  # Main thread sleep
@@ -439,7 +469,67 @@ class StreamingPipeline:
             raise
         finally:
             self.cleanup()
-    
+
+    def process_system_audio(self):
+        """Process system audio output by recording from default output device."""
+        try:
+            logger.info("Starting system audio capture...")
+            
+            # Start processing threads
+            self.start_processing_threads()
+            
+            # Create system audio stream (starts automatically)
+            self.stream = create_audio_stream(self._audio_callback, use_system_audio=True)
+            
+            print(f"\n{Fore.GREEN}Ready! Recording system audio... Press Ctrl+C to stop{Style.RESET_ALL}")
+            
+            while self.running:
+                time.sleep(0.1)  # Main thread sleep
+                
+        except Exception as e:
+            logger.error(f"Error in system audio processing: {str(e)}", exc_info=True)
+            raise
+        finally:
+            self.cleanup()
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        """Common audio callback for both microphone and system audio."""
+        try:
+            # For sounddevice (microphone)
+            if isinstance(status, sd.CallbackFlags):
+                if status and not status.input_overflow:
+                    return
+                audio_data = indata[:, 0].astype(np.float32)
+            # For pyaudiowpatch (system audio)
+            else:
+                # Audio data is already processed in the wrapped callback
+                audio_data = indata
+            
+            # Benchmark audio capture
+            with BenchmarkContext(self.audio_benchmark, "capture", len(audio_data), {
+                "frames": frames,
+                "status": str(status) if status else None
+            }) as bench:
+                bench.context["max_amplitude"] = float(np.max(np.abs(audio_data)))
+                bench.context["rms_level"] = float(np.sqrt(np.mean(audio_data**2)))
+                
+                # Put audio chunk in queue without blocking
+                try:
+                    self.audio_queue.put_nowait(audio_data)
+                except queue.Full:
+                    # Drop frame if queue is full
+                    self.audio_benchmark.record_event("drop", {"reason": "queue_full"})
+                    pass
+                
+                # For pyaudiowpatch, we need to return the callback continuation flag
+                if not isinstance(status, sd.CallbackFlags):
+                    return (None, pyaudio.paContinue)
+        
+        except Exception as e:
+            logger.error(f"Error in audio callback: {str(e)}")
+            if not isinstance(status, sd.CallbackFlags):
+                return (None, pyaudio.paComplete)
+
     def cleanup(self):
         """Cleanup resources."""
         self.running = False
@@ -449,10 +539,21 @@ class StreamingPipeline:
         for thread in self.threads:
             thread.join(timeout=1.0)
         
-        # Close microphone stream properly
-        if self.stream is not None and self.stream.active:
-            self.stream.stop()
-            self.stream.close()
+        # Close audio stream properly
+        if self.stream is not None:
+            try:
+                # For sounddevice stream
+                if hasattr(self.stream, 'active'):
+                    if self.stream.active:
+                        self.stream.stop()
+                        self.stream.close()
+                # For PyAudio stream
+                else:
+                    if self.stream.is_active():
+                        self.stream.stop_stream()
+                    self.stream.close()
+            except Exception as e:
+                logger.error(f"Error closing stream: {e}")
             self.stream = None
         
         if hasattr(self, 'executor'):
@@ -470,27 +571,8 @@ class StreamingPipeline:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Streaming transcription with diarization")
-    
-    # Input arguments
-    parser.add_argument("--use-mic", action="store_true", help="Use microphone input")
-    
-    # Model configuration
-    parser.add_argument("--model", default="large-v3-turbo", 
-                      choices=['tiny.en','tiny','base.en','base','small.en','small',
-                              'medium.en','medium','large-v1','large-v2','large-v3','large',
-                              'large-v3-turbo','distil-large-v3'],
-                      help="Name of the Whisper model to use")
-    parser.add_argument("--language", default="en", help="Language code")
-    parser.add_argument("--compute-type", choices=['int8_float16', 'float16', 'float32'],
-                      default='int8_float16', help="Model computation type")
-    parser.add_argument("--min-chunk-size", type=float, default=1.0,
-                      help="Minimum chunk size in seconds")
-    parser.add_argument("--batch-size", type=int, default=8,
-                      help="Batch size for model inference")
-    
-    # Parse arguments
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    args = parse_args("pipeline", parser)
     
     # Initialize pipeline
     pipeline = StreamingPipeline(
@@ -498,15 +580,18 @@ def main():
         language=args.language,
         compute_type=args.compute_type,
         min_chunk_size=args.min_chunk_size,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        enable_benchmark=args.benchmark
     )
     
     try:
-        # Process audio
+        # Process audio based on input source
         if args.use_mic:
             pipeline.process_microphone()
+        elif args.use_system_audio:
+            pipeline.process_system_audio()
         else:
-            parser.error("This implementation only supports microphone input")
+            parser.error("Must specify either --use-mic or --use-system-audio")
             
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}Interrupted by user{Style.RESET_ALL}")

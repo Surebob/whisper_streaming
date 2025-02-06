@@ -20,19 +20,16 @@ from rich.table import Table
 import psutil
 import queue
 from collections import deque
+from colorama import Fore, Style
 
 # Import pipeline and models after other imports
 from pipeline import StreamingPipeline
 from models.stats import ModelStatsMonitor
+from utils.logger import configure_logging, get_logger
 
 # Configure logging to file only
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("transcription.log")
-    ]
-)
+configure_logging(log_file="main.log", console_output=False)
+logger = get_logger("pipeline_ui", log_file="main.log", console_output=False)
 
 # Disable other loggers from printing to console
 logging.getLogger("faster_whisper").setLevel(logging.ERROR)
@@ -40,8 +37,6 @@ logging.getLogger("models.diarization").setLevel(logging.ERROR)
 logging.getLogger("speechbrain").setLevel(logging.ERROR)
 logging.getLogger("pyannote").setLevel(logging.ERROR)
 logging.getLogger("pipeline").setLevel(logging.ERROR)
-
-logger = logging.getLogger("pipeline_ui")
 
 # Add at top of file, after imports
 MODEL_THRESHOLDS = {
@@ -505,12 +500,11 @@ class VADDisplay:
         self.voice_progress = Progress(
             BarColumn(
                 bar_width=None,
-                style="green",
+                style="bright_black",
                 complete_style="green",
-                finished_style="green",
-                pulse_style="green"
+                finished_style="green"
             ),
-            TextColumn("[magenta]{task.percentage:>3.0f}%"),
+            TextColumn("[bright_green]{task.percentage:>3.0f}%"),
             TextColumn("•"),
             TimeElapsedColumn(),
             **progress_settings
@@ -519,10 +513,9 @@ class VADDisplay:
         self.buffer_progress = Progress(
             BarColumn(
                 bar_width=None,
-                style="magenta",
-                complete_style="magenta",
-                finished_style="magenta",
-                pulse_style="magenta"
+                style="bright_black",
+                complete_style="blue",
+                finished_style="blue"
             ),
             TextColumn("[bright_blue]{task.percentage:>3.0f}%"),
             TextColumn("•"),
@@ -533,10 +526,9 @@ class VADDisplay:
         self.silence_progress = Progress(
             BarColumn(
                 bar_width=None,
-                style="bright_blue",
-                complete_style="bright_blue",
-                finished_style="bright_blue",
-                pulse_style="bright_blue"
+                style="bright_black",
+                complete_style="yellow",
+                finished_style="yellow"
             ),
             TextColumn("[bright_yellow]{task.fields[time]:>3.1f}s"),
             TextColumn("•"),
@@ -556,7 +548,7 @@ class VADDisplay:
         self.progress_group = Group(
             self.state_text,
             Text(),  # Empty line for spacing
-            Text.from_markup("[cyan]Voice Level"),
+            Text.from_markup("[bright_green]Voice Level"),
             self.voice_progress,
             Text(),  # Empty line for spacing
             Text.from_markup("[bright_blue]Buffer Usage"),
@@ -603,25 +595,81 @@ def format_vad(pipeline) -> Group:
     return format_vad.display.get_renderable(pipeline)
 
 def main():
-    parser = argparse.ArgumentParser(description="Whisper Streaming Transcription UI")
-    parser.add_argument("--use-mic", action="store_true", help="Use microphone input")
-    parser.add_argument("--model", default="large-v3-turbo", 
-                      choices=['tiny.en','tiny','base.en','base','small.en','small',
-                              'medium.en','medium','large-v1','large-v2','large-v3','large',
-                              'large-v3-turbo','distil-large-v3'])
-    parser.add_argument("--compute-type", default="int8_float16", 
-                      choices=['int8_float16', 'float16', 'float32', 'int8'])
-    parser.add_argument("--min-chunk-size", type=float, default=1.0)
-    parser.add_argument("--batch-size", type=int, default=8)
-    args = parser.parse_args()
+    """Main entry point."""
+    # Create parser first
+    parser = argparse.ArgumentParser(
+        description="Whisper Streaming Transcription UI",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Add input configuration
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
+        "--use-mic",
+        action="store_true",
+        help="Use microphone input"
+    )
+    input_group.add_argument(
+        "--use-system-audio",
+        action="store_true",
+        help="Capture system audio output"
+    )
+    
+    # Add model configuration
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="large-v3-turbo",
+        choices=[
+            'tiny.en', 'tiny',
+            'base.en', 'base',
+            'small.en', 'small',
+            'medium.en', 'medium',
+            'large-v1', 'large-v2', 'large-v3', 'large',
+            'large-v3-turbo', 'distil-large-v3'
+        ],
+        help="Name of the Whisper model to use"
+    )
+    
+    parser.add_argument(
+        "--compute-type",
+        type=str,
+        default="int8_float16",
+        choices=['int8_float16', 'float16', 'float32', 'int8'],
+        help="Model computation type"
+    )
+    
+    parser.add_argument(
+        "--min-chunk-size",
+        type=float,
+        default=1.0,
+        help="Minimum chunk size in seconds"
+    )
+    
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Batch size for model inference"
+    )
 
+    # Add benchmark flag
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Enable performance benchmarking"
+    )
+    
+    args = parser.parse_args()
+    
     # Initialize pipeline and monitors
     pipeline = StreamingPipeline(
         model_name=args.model,
         language="en",
         compute_type=args.compute_type,
         min_chunk_size=args.min_chunk_size,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        enable_benchmark=args.benchmark
     )
     
     # Initialize and start system monitor
@@ -642,9 +690,25 @@ def main():
         format_vad(pipeline)
     )
     
-    # Start microphone processing in background
-    mic_thread = threading.Thread(target=pipeline.process_microphone, daemon=True)
-    mic_thread.start()
+    # Start audio processing in background based on input source
+    if args.use_mic:
+        print(f"\n{Fore.CYAN}=== Starting Whisper Streaming UI ===")
+        print(f"Input Source: {Fore.GREEN}Microphone{Style.RESET_ALL}")
+        print(f"Model: {Fore.GREEN}{args.model}{Style.RESET_ALL}")
+        print(f"Compute Type: {Fore.GREEN}{args.compute_type}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}==================================={Style.RESET_ALL}\n")
+        mic_thread = threading.Thread(target=pipeline.process_microphone, daemon=True)
+        mic_thread.start()
+    elif args.use_system_audio:
+        print(f"\n{Fore.CYAN}=== Starting Whisper Streaming UI ===")
+        print(f"Input Source: {Fore.GREEN}System Audio{Style.RESET_ALL}")
+        print(f"Model: {Fore.GREEN}{args.model}{Style.RESET_ALL}")
+        print(f"Compute Type: {Fore.GREEN}{args.compute_type}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}==================================={Style.RESET_ALL}\n")
+        audio_thread = threading.Thread(target=pipeline.process_system_audio, daemon=True)
+        audio_thread.start()
+    else:
+        parser.error("Must specify either --use-mic or --use-system-audio")
     
     # Main UI loop with maximum refresh rate
     with Live(
